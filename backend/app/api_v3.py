@@ -682,6 +682,35 @@ def _build_receipt_pdf(job: dict[str, Any]) -> Path:
     visual.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), gap), ("TOPPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
     story.extend([visual, Spacer(1, 3*mm)])
 
+    # Include every calculated metric and its explanation in the downloadable PDF too.
+    metric_values = receipt.get("metrics") or {}
+    metric_legend = receipt.get("metric_legend") or {}
+    if metric_values:
+        story.extend([HRFlowable(width="100%", thickness=.7, color=line, dash=[2,2]), Spacer(1, 3*mm), Paragraph("MEASURED METRICS & LEGEND", styles["ReceiptSection"]), Spacer(1, 2*mm)])
+        metric_rows = [[Paragraph("METRIC", styles["ReceiptLabel"]), Paragraph("VALUE", styles["ReceiptLabel"]), Paragraph("WHAT IT MEASURES", styles["ReceiptLabel"])]]
+        for key, value in metric_values.items():
+            definition = metric_legend.get(key, {})
+            label = str(definition.get("label") or key.replace("_", " "))
+            purpose = str(definition.get("purpose") or "Recorded processing metric.")
+            unit = str(definition.get("unit") or "")
+            if isinstance(value, float):
+                rendered_value = f"{value:.4f}"
+            else:
+                rendered_value = str(value)
+            if unit:
+                rendered_value += f" {unit}"
+            metric_rows.append([Paragraph(escape(label), styles["ReceiptTiny"]), Paragraph(escape(rendered_value), styles["ReceiptTiny"]), Paragraph(escape(purpose), styles["ReceiptTiny"])])
+        metric_table = Table(metric_rows, colWidths=[available*.25, available*.16, available*.59], repeatRows=1, hAlign="LEFT")
+        metric_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F0EFE9")),
+            ("LINEBELOW", (0,0), (-1,0), .7, line),
+            ("LINEBELOW", (0,1), (-1,-1), .25, line),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
+            ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(metric_table)
+
     prompt = str(receipt.get("prompt") or "")
     if prompt:
         story.extend([HRFlowable(width="100%", thickness=.7, color=line, dash=[2,2]), Spacer(1, 2*mm), Paragraph("EDIT REQUEST", styles["ReceiptLabel"]), Spacer(1, 1*mm), Paragraph(escape(prompt[:420]), styles["ReceiptSub"])])

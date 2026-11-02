@@ -194,7 +194,21 @@ function ReceiptPanel({ receipt, job, onDownloadPdf, onDownloadJson }) {
     <div className="p4-receipt-head"><div><span className="p4-overline">EDIT RECEIPT</span><h3>Verification summary</h3></div><span className="p4-receipt-stamp"><ShieldCheck size={16} /> {checks.length && checks.every((c) => c.pass) ? "PASS" : receipt ? "REVIEW" : "PENDING"}</span></div>
     {receipt?.summary && <p className="p4-receipt-summary">{receipt.summary}</p>}
     <div className="p4-check-list">{checks.length ? checks.map((check, i) => <div className="p4-check-row" key={`${check.name || check.check || "check"}-${i}`}><span className={check.pass ? "p4-check-icon pass" : "p4-check-icon fail"}>{check.pass ? <Check size={13} /> : <X size={13} />}</span><span>{(check.name || check.check || `Check ${i + 1}`).replaceAll("_", " ")}</span><strong>{check.pass ? "PASS" : "REVIEW"}</strong></div>) : <p className="p4-muted">Detailed checks are not available for this job type.</p>}</div>
-    {Object.keys(metrics).length > 0 && <div className="p4-metric-grid">{Object.entries(metrics).filter(([key]) => !key.startsWith("alignment_")).slice(0, 4).map(([key, value]) => <div key={key}><span>{key.replaceAll("_", " ")}</span><strong>{typeof value === "number" ? Number(value.toFixed(4)).toString() : String(value)}</strong></div>)}</div>}
+    {Object.keys(metrics).length > 0 && <>
+      <div className="p4-metric-section-title"><strong>Measured metrics</strong><span>{Object.keys(metrics).length} values recorded</span></div>
+      <div className="p4-metric-grid p4-metric-grid-all">{Object.entries(metrics).map(([key, value]) => {
+        const definition = receipt?.metric_legend?.[key];
+        const label = definition?.label || key.replaceAll("_", " ");
+        const display = typeof value === "number" ? Number(value.toFixed(4)).toString() : String(value);
+        return <div key={key} title={definition?.purpose || label}><span>{label}</span><strong>{display}{definition?.unit === "percent" ? "%" : ""}</strong><small>{definition?.purpose || "Recorded processing metric."}</small></div>;
+      })}</div>
+      <details className="p4-metric-legend"><summary><CircleHelp size={14} /> Metric legend — what each value measures</summary>
+        <div className="p4-metric-legend-list">{Object.entries(metrics).map(([key]) => {
+          const definition = receipt?.metric_legend?.[key];
+          return <div key={key}><strong>{definition?.label || key.replaceAll("_", " ")}</strong><span>{definition?.purpose || "Recorded processing metric."}</span><small>Unit: {definition?.unit || "as recorded"}</small></div>;
+        })}</div>
+      </details>
+    </>}
     {receipt?.alignment && <div className="p4-alignment-summary">
       <div className="p4-alignment-heading"><strong>Geometric alignment</strong><span>{receipt.alignment.applied ? "APPLIED" : "IDENTITY RETAINED"}</span></div>
       <div className="p4-alignment-values">
@@ -251,7 +265,22 @@ export default function App() {
   const [generationAnswers, setGenerationAnswers] = useState({});
   const [generationImprovedPrompt, setGenerationImprovedPrompt] = useState("");
 
+  const previousView = useRef(view);
   useEffect(() => { fetch(`${API}/health`).then((r) => { if (!r.ok) throw new Error(); setApiState("online"); }).catch(() => setApiState("offline")); }, []);
+  useEffect(() => {
+    const previous = previousView.current;
+    if (previous !== view && (["create", "edit"].includes(previous) || ["create", "edit"].includes(view))) {
+      setPrompt("");
+      setPlan(null);
+      setAnswerChoice("");
+      setGenerationPlan(null);
+      setGenerationAnswers({});
+      setGenerationImprovedPrompt("");
+      setError("");
+      setSuccess("");
+    }
+    previousView.current = view;
+  }, [view]);
   useEffect(() => () => { if (localPreview) URL.revokeObjectURL(localPreview); }, [localPreview]);
   const sourceUrl = useMemo(() => source ? assetUrl(source.url || `/uploads/${source.image_id}`) : localPreview, [source, localPreview]);
 
@@ -315,7 +344,7 @@ export default function App() {
       const blob = await response.blob(); const file = new File([blob], "pixl-generated.png", { type: "image/png" });
       const form = new FormData(); form.append("file", file);
       const uploaded = await requestJson(`${API}/upload`, { method: "POST", body: form });
-      setSource(uploaded); setSourceFile(null); setLocalPreview(""); setBox(null); setPoints(null); setPlan(null); setPrompt(generatedPrompt); setDimensions({ width: uploaded.width, height: uploaded.height }); clearResult(); setView("edit"); setSuccess("Generated image is ready to edit.");
+      setSource(uploaded); setSourceFile(null); setLocalPreview(""); setBox(null); setPoints(null); setPlan(null); setPrompt(""); setDimensions({ width: uploaded.width, height: uploaded.height }); clearResult(); setView("edit"); setSuccess("Generated image is ready to edit.");
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
@@ -404,6 +433,7 @@ export default function App() {
       setPoints(null);
       setPlan(null);
       setAnswerChoice("");
+      setPrompt("");
       setDimensions({ width: 0, height: 0 });
       clearResult();
       setView("edit");

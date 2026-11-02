@@ -93,6 +93,10 @@ def test_run_edit_fake_provider_receipt_and_outside_invariant(tmp_path):
     assert "fit_best_scale" in receipt["alignment"]
     assert "validation_improvement_percent" in receipt["alignment"]
     assert "pipeline_geometry" in receipt
+    assert "metric_legend" in receipt
+    assert "mean_delta_e_oklab" in receipt["metric_legend"]
+    assert "alignment_validation_improvement_percent" in receipt["metrics"]
+    assert set(receipt["metrics"]).issubset(set(receipt["metric_legend"]))
     assert receipt["schema_version"] == "1.2"
     assert "zero_changes_outside_hard_selection" in {c["name"] for c in receipt["checks"]}
     assert "polygon_seam_p95_excess" in {c["name"] for c in receipt["checks"]}
