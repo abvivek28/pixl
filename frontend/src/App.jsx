@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { API_BASE_URL, apiAssetUrl } from "./config/api";
 import {
   ArrowRight, Check, CircleHelp, Download, FileImage, FileJson, FileText, ImagePlus,
   LoaderCircle, Move, Scan, Sparkles, UploadCloud, WandSparkles, X, Zap,
   ShieldCheck, RefreshCw, SlidersHorizontal, ChevronRight
 } from "lucide-react";
 
-const API = "/api";
-const assetUrl = (path) => !path ? "" : path.startsWith("http") ? path : path.startsWith("/api") ? path : `${API}${path}`;
+const API = API_BASE_URL;
+const assetUrl = apiAssetUrl;
 const fmtBytes = (n = 0) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

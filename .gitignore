@@ -10,3 +10,9 @@ backend/uploads/*
 .DS_Store
 backend/data/
 backend/.env
+.env.*
+!*.env.example
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example

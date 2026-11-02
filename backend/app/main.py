@@ -2,11 +2,16 @@ from pathlib import Path
 from uuid import uuid4
 import json
 import mimetypes
+import os
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Load backend/.env before reading deployment configuration such as CORS origins.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -21,9 +26,15 @@ app = FastAPI(
     description="Pixl image upload, generation, planning, and deterministic regional editing API.",
     version="3.0.0",
 )
+def get_cors_origins() -> list[str]:
+    """Read allowed browser origins from BACKEND_CORS_ORIGINS (comma-separated)."""
+    configured = os.getenv("BACKEND_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+    return [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
