@@ -111,31 +111,138 @@ def expand_box(box: Box, image_width: int, image_height: int,
                min(image_width, x2 + mx), min(image_height, y2 + my))
 
 
+def _provider_output_size(width: int, height: int, *, minimum: int = 256,
+                          maximum: int = 1920, multiple: int = 8) -> tuple[int, int]:
+    """Choose legal provider dimensions while preserving the crop aspect ratio.
+
+    Scale the complete crop uniformly until its shorter side reaches the
+    provider minimum (or its longer side reaches the provider maximum), then
+    quantize to multiples of eight with the smallest aspect-ratio error.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("Crop dimensions must be positive.")
+    ratio = width / height
+    scale = max(minimum / width, minimum / height, 1.0)
+    if max(width, height) * scale > maximum:
+        scale = maximum / max(width, height)
+    scaled_w, scaled_h = width * scale, height * scale
+
+    def candidates(value: float) -> list[int]:
+        lo = max(minimum, int(math.floor(value / multiple)) * multiple)
+        hi = min(maximum, int(math.ceil(value / multiple)) * multiple)
+        return sorted({v for v in (lo, hi, int(round(value / multiple)) * multiple)
+                       if minimum <= v <= maximum})
+
+    # Search the dimension with fewer quantization candidates, derive the other
+    # from the source ratio, and choose the legal pair with minimum ratio error.
+    w_candidates = candidates(scaled_w)
+    h_candidates = candidates(scaled_h)
+    pairs: list[tuple[float, float, int, int]] = []
+    for ow in w_candidates:
+        ideal_h = ow / ratio
+        for oh in candidates(ideal_h) + h_candidates:
+            if minimum <= oh <= maximum:
+                ratio_error = abs((ow / oh) / ratio - 1.0)
+                scale_error = abs(ow / scaled_w - oh / scaled_h)
+                pairs.append((ratio_error, scale_error, ow, oh))
+    for oh in h_candidates:
+        ideal_w = oh * ratio
+        for ow in candidates(ideal_w) + w_candidates:
+            if minimum <= ow <= maximum:
+                ratio_error = abs((ow / oh) / ratio - 1.0)
+                scale_error = abs(ow / scaled_w - oh / scaled_h)
+                pairs.append((ratio_error, scale_error, ow, oh))
+    if not pairs:
+        raise ValueError(
+            f"Crop aspect ratio {ratio:.4f} cannot fit provider dimensions "
+            f"[{minimum}, {maximum}] while preserving aspect ratio."
+        )
+    _, _, out_w, out_h = min(pairs)
+    return int(out_w), int(out_h)
+
+
 def prepare_model_input(crop: Image.Image, max_side: int = 512,
                         preferred_side: int = 504) -> tuple[Image.Image, tuple[int, int]]:
-    """Downscale crop to <= max_side and propose provider output dimensions matching crop size.
+    """Prepare a bounded model input and aspect-ratio-preserving output size.
 
-    The output dimensions are rounded to the nearest multiple of 8 (required by
-    most diffusion-model providers) and clamped to [256, 1920].  By matching the
-    crop's native resolution instead of a fixed preferred_side, the provider
-    result can be composited back without a large rescale that would distort
-    spatial proportions.
+    The model input is uniformly downscaled to max_side. Provider output
+    dimensions are independently selected from the original crop dimensions,
+    uniformly scaled to satisfy the provider's [256, 1920] limits and quantized
+    to multiples of eight. X/Y are never independently clamped.
     """
     source = crop.convert("RGB")
     scale = min(1.0, max_side / max(source.size))
     model_size = (max(1, round(source.width * scale)), max(1, round(source.height * scale)))
     model_input = source.resize(model_size, Image.Resampling.LANCZOS) if model_size != source.size else source.copy()
-
-    # Propose output dimensions that match the crop's native size so the
-    # provider result aligns with the compositing target without a large
-    # rescale.  Round to the nearest multiple of 8 for provider compatibility,
-    # clamped to the commonly supported [256, 1920] range.
-    def _round_to_8(v: int) -> int:
-        return max(256, min(1920, int(round(v / 8)) * 8))
-
-    out_size = (_round_to_8(source.width), _round_to_8(source.height))
+    out_size = _provider_output_size(source.width, source.height)
     return model_input, out_size
 
+
+def normalize_provider_output(
+    generated: Image.Image,
+    target_size: tuple[int, int],
+    *,
+    small_aspect_tolerance: float = 0.015,
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Map provider output to crop coordinates without anisotropic stretch/crop.
+
+    Uniformly scale the complete provider frame to fit inside the target canvas.
+    If the aspect ratios differ, extend the edge pixels to fill the remaining
+    canvas. This preserves all generated content and makes the offset explicit;
+    normal operation should have only a tiny quantization difference because
+    prepare_model_input requests a ratio-matched output size.
+    """
+    source = generated.convert("RGB")
+    source_w, source_h = source.size
+    target_w, target_h = map(int, target_size)
+    if min(source_w, source_h, target_w, target_h) <= 0:
+        raise ValueError("Provider and target image dimensions must be positive.")
+    source_ratio = source_w / source_h
+    target_ratio = target_w / target_h
+    ratio_error = abs(source_ratio / target_ratio - 1.0)
+    scale = min(target_w / source_w, target_h / source_h)
+    fitted_w = max(1, min(target_w, int(round(source_w * scale))))
+    fitted_h = max(1, min(target_h, int(round(source_h * scale))))
+    fitted = source.resize((fitted_w, fitted_h), Image.Resampling.LANCZOS)
+    left = (target_w - fitted_w) // 2
+    top = (target_h - fitted_h) // 2
+    # Edge extension avoids artificial black bars and does not discard content.
+    canvas = Image.new("RGB", (target_w, target_h))
+    canvas.paste(fitted, (left, top))
+    arr = np.asarray(canvas).copy()
+    fitted_arr = np.asarray(fitted)
+    if left:
+        arr[top:top + fitted_h, :left] = fitted_arr[:, :1]
+    if pad_right := (target_w - fitted_w - left):
+        arr[top:top + fitted_h, left + fitted_w:] = fitted_arr[:, -1:]
+    if top:
+        arr[:top, :] = arr[top:top + 1, :]
+    if pad_bottom := (target_h - fitted_h - top):
+        arr[top + fitted_h:, :] = arr[top + fitted_h - 1:top + fitted_h, :]
+    normalized = Image.fromarray(arr.astype(np.uint8), "RGB")
+    pad_right = target_w - fitted_w - left
+    pad_bottom = target_h - fitted_h - top
+    policy = "uniform_fit_with_edge_extension" if any((left, top, pad_right, pad_bottom)) else "uniform_full_frame_resize"
+    metadata = {
+        "policy": policy,
+        "provider_width": source_w, "provider_height": source_h,
+        "target_width": target_w, "target_height": target_h,
+        "provider_aspect_ratio": round(source_ratio, 8),
+        "target_aspect_ratio": round(target_ratio, 8),
+        "relative_aspect_error": round(ratio_error, 8),
+        "uniform_scale": round(scale, 10),
+        "crop_offsets_px": {"left": 0, "top": 0, "right_removed": 0, "bottom_removed": 0},
+        "edge_extension_px": {"left": left, "top": top, "right": pad_right, "bottom": pad_bottom},
+        "fitted_width": fitted_w, "fitted_height": fitted_h,
+        "scale_x_provider_to_crop": round(scale, 10),
+        "scale_y_provider_to_crop": round(scale, 10),
+        "model_input_resize_scale_x": None,
+        "model_input_resize_scale_y": None,
+        "aspect_ratio_corrected": bool(ratio_error > 1e-6),
+        "aspect_ratio_corrected_without_stretching": True,
+        "content_cropped": False,
+    }
+    return normalized, metadata
 
 def to_oklab(rgb_u8: np.ndarray) -> np.ndarray:
     c = np.asarray(rgb_u8, dtype=np.float32) / 255.0

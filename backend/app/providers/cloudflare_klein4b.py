@@ -29,7 +29,9 @@ def edit_prompt(instruction: str, preserve: list[str] | None = None) -> str:
         "5. Preserve the original background and overall colour grade, white balance, exposure, contrast, saturation, shadows, and lighting. Do not apply a global style or colour-grade change unless explicitly requested.\n"
         "6. Match the surrounding lighting, colour temperature, grain, texture, and sharpness at the edited area so it blends naturally.\n"
         f"7. Additional details to preserve: {preserve_text}.\n"
-        "8. Return only the edited image, at the exact same framing and dimensions as the input.\n"
+        "8. Treat the outer context as a registration reference: preserve the location of background edges, object boundaries, shadows, reflections and texture outside the requested edit.\n"
+        "9. Do not let the requested edit spread into the surrounding context. Preserve a clean, stable transition at the boundary of the requested change.\n"
+        "10. Return only the edited image, at the exact same framing and dimensions as the input.\n"
         "IT IS VERY IMPORTANT TO NOT CHANGE COLOUR GRADING OF IMAGE OR BACKGROUND. THE COMPLETE IMAGE PROPORTIONS MUST BE SAME AS INPUT IMAGE. YOU SHOULD ONLY MAKE THE LOCALIZED CHANGE AS SPECIFIED BY USER."
     )
 
@@ -51,11 +53,13 @@ class CloudflareKlein4B(EditProvider):
         self.cache_dir = Path(cache_dir or os.getenv("PIXL_PROVIDER_CACHE_DIR", str(Path(__file__).resolve().parents[2] / "data" / "provider_cache")))
         self.timeout = timeout or float(os.getenv("PIXL_PROVIDER_TIMEOUT_SECONDS", "90"))
         self.retries = retries if retries is not None else int(os.getenv("PIXL_PROVIDER_RETRIES", "3"))
+        guidance_value = os.getenv("CLOUDFLARE_GUIDANCE", "4.0").strip()
+        self.guidance = float(guidance_value) if guidance_value else None
         self.client = client or httpx.Client(timeout=self.timeout)
         self._sleep = sleep
 
     def _cache_key(self, image_bytes: bytes, prompt: str, out_size: tuple[int, int], seed: int | None) -> str:
-        payload = b"\0".join([image_bytes, prompt.encode(), f"{out_size[0]}x{out_size[1]}".encode(), str(seed).encode(), self.name.encode(), self.model.encode()])
+        payload = b"\0".join([image_bytes, prompt.encode(), f"{out_size[0]}x{out_size[1]}".encode(), str(seed).encode(), str(self.guidance).encode(), self.name.encode(), self.model.encode()])
         return sha256(payload).hexdigest()
 
     @staticmethod
@@ -92,6 +96,7 @@ class CloudflareKlein4B(EditProvider):
         url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run/{self.model}"
         fields = {"prompt": prompt, "width": str(int(out_size[0])), "height": str(int(out_size[1]))}
         if seed is not None: fields["seed"] = str(int(seed))
+        if self.guidance is not None: fields["guidance"] = str(self.guidance)
         last_error = None
         for attempt in range(max(0, self.retries) + 1):
             try:

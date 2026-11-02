@@ -210,6 +210,10 @@ def _run_edit_job(job_id: str, request_data: dict[str, Any]) -> None:
             "result": str(output_dir / "result.png"),
             "heatmap": str(output_dir / "heatmap.png"),
             "receipt": str(output_dir / "receipt.json"),
+            "generated_unaligned": str(output_dir / "generated_unaligned.png"),
+            "generated_aligned": str(output_dir / "generated_aligned.png"),
+            "generated_provider_raw": str(output_dir / "generated_provider_raw.png"),
+            "alignment_diagnostics": str(output_dir / "alignment_diagnostics.jsonl"),
         }
         (output_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         artifacts["result_json"] = str(output_dir / "result.json")
@@ -640,6 +644,17 @@ def _build_receipt_pdf(job: dict[str, Any]) -> Path:
         stat_cells.append(cell)
     stat_table = Table([stat_cells], colWidths=[stat_w]*4, hAlign="LEFT")
     stat_table.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 3), ("TOPPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
+    alignment_info = receipt.get("alignment") or {}
+    if alignment_info:
+        alignment_text = (
+            f"<b>GEOMETRIC ALIGNMENT:</b> "
+            f"{'Applied' if alignment_info.get('applied') else 'Identity retained'}"
+            f" &nbsp; | &nbsp; Scale {float(alignment_info.get('scale', 1.0)):.4f}x"
+            f" &nbsp; | &nbsp; X {float(alignment_info.get('translation_x', 0.0)):.1f}px"
+            f" &nbsp; | &nbsp; Y {float(alignment_info.get('translation_y', 0.0)):.1f}px"
+            f" &nbsp; | &nbsp; Improvement {float(alignment_info.get('improvement_percent', 0.0)):.2f}%"
+        )
+        story.extend([Paragraph(alignment_text, styles["ReceiptSub"]), Spacer(1, 3*mm)])
     story.extend([stat_table, Spacer(1, 5*mm), HRFlowable(width="100%", thickness=.7, color=line, dash=[2,2]), Spacer(1, 3*mm), Paragraph("VISUAL EVIDENCE", styles["ReceiptSection"]), Spacer(1, 2*mm)])
 
     def fitted_image(path: Path, max_w: float, max_h: float):
@@ -689,7 +704,9 @@ def download_receipt_pdf(job_id: str):
 
 @router.get("/jobs/{job_id}/artifacts/{artifact_name}")
 def get_artifact(job_id: str, artifact_name: str):
-    allowed = {"original", "result", "heatmap", "receipt", "receipt_pdf", "result_json"}
+    allowed = {"original", "result", "heatmap", "receipt", "receipt_pdf", "result_json",
+               "generated_unaligned", "generated_aligned", "generated_provider_raw",
+               "alignment_diagnostics"}
     if artifact_name not in allowed:
         raise HTTPException(status_code=404, detail="Unknown artifact.")
     with _lock:

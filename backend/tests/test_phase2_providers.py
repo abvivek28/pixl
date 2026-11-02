@@ -84,6 +84,21 @@ def test_run_edit_fake_provider_receipt_and_outside_invariant(tmp_path):
     assert (tmp_path/"out"/"result.png").exists()
     assert (tmp_path/"out"/"heatmap.png").exists()
     assert (tmp_path/"out"/"receipt.json").exists()
+    assert (tmp_path/"out"/"generated_provider_raw.png").exists()
+    diagnostics = (tmp_path/"out"/"alignment_diagnostics.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(diagnostics) == 1
+    diagnostic = json.loads(diagnostics[0])
+    assert "normalization" in diagnostic
+    receipt = json.loads((tmp_path/"out"/"receipt.json").read_text(encoding="utf-8"))
+    assert "fit_best_scale" in receipt["alignment"]
+    assert "validation_improvement_percent" in receipt["alignment"]
+    assert "pipeline_geometry" in receipt
+    assert receipt["schema_version"] == "1.2"
+    assert "zero_changes_outside_hard_selection" in {c["name"] for c in receipt["checks"]}
+    assert "polygon_seam_p95_excess" in {c["name"] for c in receipt["checks"]}
+    history = tmp_path / "alignment_history.jsonl"
+    assert history.exists()
+    assert len(history.read_text(encoding="utf-8").splitlines()) == 1
 
 def test_global_edit_returns_warning_even_without_box():
     plan={"target_phrase":"whole image","edit_type":"global","instruction":"make the image look cinematic",
@@ -140,7 +155,7 @@ def test_run_edit_uses_meta_instruction_preserve_and_selected_box(tmp_path):
     assert captured["instruction"] == "make the selected object blue"
     assert captured["preserve"] == ["background", "lighting"]
     assert result["boxes"]["selected"] == {"x1": 20, "y1": 15, "x2": 70, "y2": 65}
-    assert result["boxes"]["expanded"] == {"x1": 5, "y1": 0, "x2": 85, "y2": 80}
+    assert result["boxes"]["expanded"] == {"x1": -20, "y1": -25, "x2": 110, "y2": 105}
     assert result["metrics"]["outside_changed_pixels"] == 0
 
 
@@ -152,7 +167,7 @@ def test_run_edit_corrects_provider_aspect_ratio_without_stretching(tmp_path):
         model = "wrong-aspect-test-v1"
         def edit(self, image, instruction, out_size, seed, *, preserve=None):
             # Deliberately return a wide image for the square context crop. The engine
-            # should center-crop to square before resizing, rather than stretching.
+            # must preserve all content using uniform fit + edge extension, never crop/stretch.
             return Image.new("RGB", (160, 40), (180, 40, 20))
 
     source = tmp_path / "portrait.png"
@@ -163,13 +178,15 @@ def test_run_edit_corrects_provider_aspect_ratio_without_stretching(tmp_path):
     receipt = json.loads((out / "receipt.json").read_text())
     assert result["metrics"]["outside_changed_pixels"] == 0
     assert receipt["model_input"]["aspect_ratio_corrected_without_stretching"] is True
+    assert receipt["model_input"]["normalization"]["content_cropped"] is False
+    assert receipt["model_input"]["normalization"]["policy"] == "uniform_fit_with_edge_extension"
     assert receipt["model_input"]["provider_output_width"] == 160
     assert receipt["model_input"]["provider_output_height"] == 40
     with Image.open(out / "result.png") as final_image:
         assert final_image.size == (120, 180)
 
 
-def test_square_selection_uses_fixed_15px_context_and_edge_padding(tmp_path):
+def test_square_selection_uses_40px_context_and_edge_padding(tmp_path):
     source = tmp_path / "edge.png"
     Image.new("RGB", (80, 80), (100, 120, 140)).save(source)
     captured = {}
@@ -186,12 +203,12 @@ def test_square_selection_uses_fixed_15px_context_and_edge_padding(tmp_path):
     result = run_edit(source, "only edit the selected object", out,
                       selected_box=Box(0, 0, 20, 20), provider=RecordingProvider())
     receipt = json.loads((out / "receipt.json").read_text())
-    assert captured["input_size"] == (50, 50)
+    assert captured["input_size"] == (100, 100)
     assert captured["out_size"][0] == captured["out_size"][1]
     assert result["boxes"]["selected"] == {"x1": 0, "y1": 0, "x2": 20, "y2": 20}
-    assert result["boxes"]["expanded"] == {"x1": -15, "y1": -15, "x2": 35, "y2": 35}
-    assert receipt["model_input"]["context_margin_px"] == 15
-    assert receipt["model_input"]["context_padding_px"] == {"left": 15, "top": 15, "right": 0, "bottom": 0}
+    assert result["boxes"]["expanded"] == {"x1": -40, "y1": -40, "x2": 60, "y2": 60}
+    assert receipt["model_input"]["context_margin_px"] == 40
+    assert receipt["model_input"]["context_padding_px"] == {"left": 40, "top": 40, "right": 0, "bottom": 0}
     assert result["metrics"]["outside_changed_pixels"] == 0
 
 
@@ -206,3 +223,29 @@ def test_rectangular_selection_allowed_and_preserved(tmp_path):
     assert result["boxes"]["selected"] == {"x1": 10, "y1": 10, "x2": 70, "y2": 50}
     with Image.open(out / "result.png") as final_image:
         assert final_image.size == (100, 80)
+
+
+def test_freehand_composite_does_not_change_pixels_outside_polygon(tmp_path):
+    source = tmp_path / "polygon-source.png"
+    arr = np.full((120, 140, 3), 100, dtype=np.uint8)
+    arr[20:100, 20:120] = np.arange(100, dtype=np.uint8)[None, :, None] if False else 150
+    Image.fromarray(arr, "RGB").save(source)
+    points = [[35, 30], [100, 25], [110, 70], [75, 95], [30, 75]]
+    class SolidProvider:
+        name = "solid"
+        model = "solid-test"
+        def edit(self, image, instruction, out_size, seed, *, preserve=None):
+            return Image.new("RGB", image.size, (220, 30, 20))
+    out = tmp_path / "polygon-out"
+    receipt = run_edit(source, "edit selected shape", out,
+                       selected_box=Box(30, 25, 111, 96), points=points,
+                       provider=SolidProvider())
+    original = np.asarray(Image.open(source).convert("RGB"))
+    result = np.asarray(Image.open(receipt["artifacts"]["result"]).convert("RGB"))
+    from app.engine.seam_detection import polygon_mask
+    hard = np.zeros(original.shape[:2], dtype=bool)
+    hard[25:96, 30:111] = polygon_mask((81, 71),
+        [[x-30, y-25] for x, y in points], (0, 0, 81, 71))
+    changed = np.any(original != result, axis=2)
+    assert np.count_nonzero(changed & ~hard) == 0
+    assert receipt["metrics"]["outside_selected_polygon_changed_pixels"] == 0

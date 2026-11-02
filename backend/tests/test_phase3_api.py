@@ -71,7 +71,7 @@ def test_edit_job_returns_result_heatmap_receipt_and_original(monkeypatch, tmp_p
     assert receipt.status_code == 200
     assert receipt.json()["metrics"]["outside_changed_pixels"] == 0
     assert receipt.json()["boxes"]["selected"] == {"x1": 15, "y1": 10, "x2": 55, "y2": 50}
-    assert receipt.json()["boxes"]["expanded"] == {"x1": 0, "y1": -5, "x2": 70, "y2": 65}
+    assert receipt.json()["boxes"]["expanded"] == {"x1": -25, "y1": -30, "x2": 95, "y2": 90}
     assert client.get(job["artifacts"]["result"]).status_code == 200
     assert client.get(job["artifacts"]["heatmap"]).status_code == 200
 

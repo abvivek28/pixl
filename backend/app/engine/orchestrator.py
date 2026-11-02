@@ -1,14 +1,16 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
-import json, time
+import json, time, os
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw, ImageFilter
 from .deterministic import (Box, expand_box, prepare_model_input, to_oklab, from_oklab,
                             delta_e, _ring_mask, _median_oklab_offset, _feather_mask,
-                            _laplacian_variance, file_sha256)
+                            _laplacian_variance, file_sha256, normalize_provider_output)
 from app.providers.cloudflare_klein4b import EditProvider, CloudflareKlein4B, ProviderError
 from app.planning.meta_planner import MetaPlanner, PlanningResult, convert_box_2d_to_pixels
+from .alignment import align_generated_image
+from .seam_detection import polygon_mask, evaluate_seam, adaptive_feather_alpha
 
 class FakeHueShiftProvider(EditProvider):
     """Offline test provider used when --provider fake is selected."""
@@ -73,10 +75,9 @@ def run_edit(image_path: str | Path, instruction: str, output_dir: str | Path, *
     B = Box(max(0, selected_box.x1), max(0, selected_box.y1), min(w, selected_box.x2), min(h, selected_box.y2))
     if B.width <= 0 or B.height <= 0: raise ValueError("Selected box must have positive area inside the image.")
 
-    # Fixed context border: exactly 15 source pixels on each side. Near image
-    # edges, missing context is edge-padded so the model receives surrounding context
-    # and the selected region remains at offset (15, 15) in that crop.
-    context_margin = 15
+    # Give registration a 30px movement budget plus a 10px genuine-context
+    # safety band. Edge padding is tracked separately and never scored as context.
+    context_margin = 40
     virtual_x1, virtual_y1 = B.x1 - context_margin, B.y1 - context_margin
     virtual_x2, virtual_y2 = B.x2 + context_margin, B.y2 + context_margin
     E = Box(virtual_x1, virtual_y1, virtual_x2, virtual_y2)
@@ -87,34 +88,71 @@ def run_edit(image_path: str | Path, instruction: str, output_dir: str | Path, *
     pad_right, pad_bottom = virtual_x2 - clipped_x2, virtual_y2 - clipped_y2
     context_arr = np.pad(clipped, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode="edge")
     crop = Image.fromarray(context_arr.astype(np.uint8), "RGB")
-    model_input, out_size = prepare_model_input(crop, max_side=504, preferred_side=504)
+    model_input, out_size = prepare_model_input(crop, max_side=768, preferred_side=768)
     provider = provider or FakeHueShiftProvider()
     preserve = plan_data.get("preserve", []) if plan_data else []
     effective_instruction = plan_data.get("instruction") or instruction or "Apply a localized edit"
-    generated = provider.edit(model_input, effective_instruction, out_size, seed, preserve=preserve)
-    generated = generated.convert("RGB")
-    provider_output_size = generated.size
-    # Preserve aspect ratio if a provider unexpectedly returns an image with
-    # a different aspect ratio: center-crop to target_ratio, then resize to native
-    # context dimensions. Never stretch a result into the crop.
-    target_ratio = crop.width / crop.height
-    output_ratio = generated.width / generated.height
-    if abs(output_ratio - target_ratio) > 1e-6:
-        if output_ratio > target_ratio:
-            fitted_width = max(1, min(generated.width, int(round(generated.height * target_ratio))))
-            left = max(0, (generated.width - fitted_width) // 2)
-            generated = generated.crop((left, 0, left + fitted_width, generated.height))
-        else:
-            fitted_height = max(1, min(generated.height, int(round(generated.width / target_ratio))))
-            top = max(0, (generated.height - fitted_height) // 2)
-            generated = generated.crop((0, top, generated.width, top + fitted_height))
-    generated = generated.resize(crop.size, Image.Resampling.LANCZOS)
+    generated_provider_raw = provider.edit(model_input, effective_instruction, out_size, seed, preserve=preserve).convert("RGB")
+    provider_output_size = generated_provider_raw.size
+    provider_raw_path = output_dir / "generated_provider_raw.png"
+    generated_provider_raw.save(provider_raw_path, format="PNG", optimize=False)
+    generated, normalization = normalize_provider_output(generated_provider_raw, crop.size)
+    normalization["model_input_resize_scale_x"] = round(model_input.width / crop.width, 10)
+    normalization["model_input_resize_scale_y"] = round(model_input.height / crop.height, 10)
     original_crop = np.asarray(crop, dtype=np.uint8)
+
+    # Keep the user's selection fixed in original-image coordinates. Alignment
+    # transforms only the generated crop, never the polygon or compositing mask.
+    local_selection_box = (
+        context_margin, context_margin,
+        context_margin + B.width, context_margin + B.height,
+    )
+    local_points = None
+    if points and len(points) >= 3:
+        local_points = [[int(round(p[0] - virtual_x1)),
+                         int(round(p[1] - virtual_y1))] for p in points]
+
+    valid_context_rect = (
+        pad_left, pad_top,
+        pad_left + clipped.shape[1], pad_top + clipped.shape[0],
+    )
+    raw_generated_path = output_dir / "generated_unaligned.png"
+    generated.save(raw_generated_path, format="PNG", optimize=False)
+
+    alignment = align_generated_image(
+        crop, generated,
+        selection_box=local_selection_box,
+        points_local=local_points,
+        valid_rect=valid_context_rect,
+        context_margin_px=context_margin,
+        safety_margin_px=10,
+        max_translation_px=30.0,
+        min_scale=0.80,
+        max_scale=1.20,
+        registration_band_px=8.0,
+        coarse_best_count=4,
+    )
+    generated = alignment.image
+    aligned_generated_path = output_dir / "generated_aligned.png"
+    generated.save(aligned_generated_path, format="PNG", optimize=False)
     generated_arr = np.asarray(generated, dtype=np.uint8)
-    # B is always exactly 15 pixels inward from the virtual expanded crop.
-    # Ring-mask helper uses absolute boxes, so build a local context ring here.
-    ring = np.ones((crop.height, crop.width), dtype=bool)
-    ring[context_margin:context_margin+B.height, context_margin:context_margin+B.width] = False
+
+    # Colour correction uses valid context outside the actual selection polygon,
+    # including unselected pixels inside its bounding rectangle.
+    selection_mask = np.zeros((crop.height, crop.width), dtype=bool)
+    if local_points and len(local_points) >= 3:
+        polygon = Image.new("L", crop.size, 0)
+        ImageDraw.Draw(polygon).polygon(
+            [(x, y) for x, y in local_points], fill=255
+        )
+        selection_mask = np.asarray(polygon, dtype=np.uint8) > 0
+    else:
+        selection_mask[local_selection_box[1]:local_selection_box[3],
+                       local_selection_box[0]:local_selection_box[2]] = True
+    valid_mask = np.zeros((crop.height, crop.width), dtype=bool)
+    valid_mask[pad_top:pad_top + clipped.shape[0],
+               pad_left:pad_left + clipped.shape[1]] = True
+    ring = (~selection_mask) & valid_mask
     if ring.any():
         offset = _median_oklab_offset(original_crop[ring], generated_arr[ring])
     else:
@@ -124,21 +162,44 @@ def run_edit(image_path: str | Path, instruction: str, output_dir: str | Path, *
     bx2, by2 = bx1 + B.width, by1 + B.height
     patch = corrected[by1:by2, bx1:bx2]
     old_patch = original_arr[B.y1:B.y2, B.x1:B.x2]
+    poly_coords = None
     if points and len(points) >= 3:
         poly_coords = [(p[0] - B.x1, p[1] - B.y1) for p in points]
-        mask_img = Image.new("L", (B.width, B.height), 0)
-        draw = ImageDraw.Draw(mask_img)
-        draw.polygon(poly_coords, fill=255)
-        feathered = mask_img.filter(ImageFilter.GaussianBlur(radius=1.5))
-        alpha = (np.asarray(feathered, dtype=np.float32) / 255.0)[..., None]
+        mask_patch = polygon_mask((B.width, B.height),
+                                  [[int(x), int(y)] for x, y in poly_coords],
+                                  (0, 0, B.width, B.height))
+        alpha_2d = adaptive_feather_alpha(mask_patch, base_radius=2.0)
+        alpha = alpha_2d[..., None]
     else:
+        mask_patch = np.ones((B.height, B.width), dtype=bool)
         alpha = _feather_mask(B.width, B.height, feather_px, B.x1 == 0, B.y1 == 0, B.x2 == w, B.y2 == h)[..., None]
     blended = np.clip(np.rint(old_patch * (1-alpha) + patch * alpha), 0, 255).astype(np.uint8)
+    # Evaluate the real polygon contour, then adapt feathering only if the
+    # measured discontinuity is substantial. The original mask remains fixed.
+    seam_composite = original_crop.copy()
+    seam_composite[by1:by2, bx1:bx2] = blended
+    seam_before = evaluate_seam(original_crop, seam_composite, selection_mask)
+    if poly_coords is not None and max(
+            seam_before.get("excess_boundary_step", 0.0),
+            seam_before.get("p95_excess_boundary_step", 0.0) * 0.65) > 12.0:
+        alpha_2d = adaptive_feather_alpha(mask_patch, base_radius=2.0, seam_metrics=seam_before)
+        alpha = alpha_2d[..., None]
+        blended = np.clip(np.rint(old_patch * (1-alpha) + patch * alpha), 0, 255).astype(np.uint8)
     result_arr = original_arr.copy()
     result_arr[B.y1:B.y2, B.x1:B.x2] = blended
 
-    outside = np.ones((h, w), dtype=bool); outside[B.y1:B.y2, B.x1:B.x2] = False
-    outside_changed = int(np.count_nonzero(np.any(result_arr != original_arr, axis=2) & outside))
+    changed_pixels = np.any(result_arr != original_arr, axis=2)
+    outside_box = np.ones((h, w), dtype=bool)
+    outside_box[B.y1:B.y2, B.x1:B.x2] = False
+    outside_changed = int(np.count_nonzero(changed_pixels & outside_box))
+    hard_selection_full = np.zeros((h, w), dtype=bool)
+    hard_selection_full[B.y1:B.y2, B.x1:B.x2] = mask_patch
+    outside_hard_selection_changed = int(np.count_nonzero(changed_pixels & ~hard_selection_full))
+    feather_band_patch = (mask_patch & (alpha[..., 0] < 0.999))
+    feather_band_full = np.zeros((h, w), dtype=bool)
+    feather_band_full[B.y1:B.y2, B.x1:B.x2] = feather_band_patch
+    feather_band_changed = int(np.count_nonzero(changed_pixels & feather_band_full))
+    outside_feather_support_changed = int(np.count_nonzero(changed_pixels & ~hard_selection_full))
     full_delta = delta_e(original_arr, result_arr)
     box_delta = full_delta[B.y1:B.y2, B.x1:B.x2]
     changed_pct = float(np.mean(box_delta > 0.05) * 100)
@@ -147,17 +208,11 @@ def run_edit(image_path: str | Path, instruction: str, output_dir: str | Path, *
     ring_delta = delta_e(original_crop[ring], corrected_ring[ring]) if ring.any() else np.array([], dtype=np.float32)
     ring_drift = float(np.median(ring_delta)) if ring_delta.size else 0.0
 
-    rgb = result_arr.astype(np.float32)
-    neighbors = []
-    if w > 1: neighbors.append(np.linalg.norm(np.diff(rgb, axis=1), axis=2).ravel())
-    if h > 1: neighbors.append(np.linalg.norm(np.diff(rgb, axis=0), axis=2).ravel())
-    typical = float(np.median(np.concatenate(neighbors))) if neighbors else 1.0
-    edge_steps = []
-    if B.x1 > 0: edge_steps.extend(np.linalg.norm(rgb[B.y1:B.y2,B.x1] - rgb[B.y1:B.y2,B.x1-1], axis=1).tolist())
-    if B.x2 < w: edge_steps.extend(np.linalg.norm(rgb[B.y1:B.y2,B.x2-1] - rgb[B.y1:B.y2,B.x2], axis=1).tolist())
-    if B.y1 > 0: edge_steps.extend(np.linalg.norm(rgb[B.y1, B.x1:B.x2] - rgb[B.y1-1,B.x1:B.x2], axis=1).tolist())
-    if B.y2 < h: edge_steps.extend(np.linalg.norm(rgb[B.y2-1,B.x1:B.x2] - rgb[B.y2,B.x1:B.x2], axis=1).tolist())
-    seam_ratio = float(np.median(edge_steps) / max(typical, 1.0)) if edge_steps else 0.0
+    seam_composite = original_crop.copy()
+    seam_composite[by1:by2, bx1:bx2] = blended
+    seam_metrics = evaluate_seam(original_crop, seam_composite, selection_mask)
+    seam_ratio = float(seam_metrics.get("excess_boundary_step", 0.0) /
+                       max(float(seam_metrics.get("baseline_step", 0.0)), 1.0))
     texture_ratio = _texture_ratio(blended, original_crop, ring)
 
     result_path, heat_path = output_dir / "result.png", output_dir / "heatmap.png"
@@ -167,14 +222,39 @@ def run_edit(image_path: str | Path, instruction: str, output_dir: str | Path, *
     heat[B.y1:B.y2,B.x1:B.x2,0] = scaled
     heat[B.y1:B.y2,B.x1:B.x2,1] = (scaled.astype(np.float32)*0.28).astype(np.uint8)
     Image.fromarray(heat, "RGB").save(heat_path, format="PNG")
-    metrics = {"outside_changed_pixels": outside_changed, "percent_box_changed": changed_pct,
+    metrics = {"outside_changed_pixels": outside_changed,
+        "outside_selected_polygon_changed_pixels": outside_hard_selection_changed,
+        "outside_feather_support_changed_pixels": outside_feather_support_changed,
+        "feather_band_changed_pixels": feather_band_changed,
+        "percent_box_changed": changed_pct,
         "mean_delta_e_oklab": mean_delta, "ring_drift_median_delta_e_oklab": ring_drift,
         "seam_ratio": seam_ratio, "texture_ratio": texture_ratio, "changed_pixel_threshold_delta_e": 0.05,
+        "seam_boundary_mean_step": seam_metrics.get("mean_boundary_step", 0.0),
+        "seam_boundary_p95_step": seam_metrics.get("p95_boundary_step", 0.0),
+        "seam_excess_boundary_step": seam_metrics.get("excess_boundary_step", 0.0),
+        "seam_p95_excess_boundary_step": seam_metrics.get("p95_excess_boundary_step", 0.0),
+        "seam_halo_score": seam_metrics.get("halo_score", 0.0),
+        "alignment_improvement_percent": round(alignment.improvement_percent, 4),
+        "alignment_scale": round(alignment.scale, 5),
+        "alignment_translation_x": round(alignment.translation_x, 3),
+        "alignment_translation_y": round(alignment.translation_y, 3),
         "elapsed_seconds": round(time.perf_counter()-started, 4)}
+    seam_mean = float(seam_metrics.get("excess_boundary_step", 0.0))
+    seam_p95 = float(seam_metrics.get("p95_excess_boundary_step", 0.0))
+    halo_score = float(seam_metrics.get("halo_score", 0.0))
     checks = [
         {"name":"zero_changes_outside_selected_box", "pass":outside_changed == 0, "actual":outside_changed, "threshold":0},
+        {"name":"zero_changes_outside_hard_selection", "pass":outside_hard_selection_changed == 0,
+         "actual":outside_hard_selection_changed, "threshold":0},
+        {"name":"zero_changes_outside_feather_support", "pass":outside_feather_support_changed == 0,
+         "actual":outside_feather_support_changed, "threshold":0},
         {"name":"ring_drift", "pass":ring_drift < .03, "actual":ring_drift, "threshold":"< 0.03"},
-        {"name":"seam_ratio", "pass":seam_ratio < 1.5, "actual":seam_ratio, "threshold":"< 1.5"},
+        {"name":"polygon_seam_mean_excess", "pass":seam_mean < 24.0,
+         "actual":seam_mean, "threshold":"< 24 RGB levels"},
+        {"name":"polygon_seam_p95_excess", "pass":seam_p95 < 36.0,
+         "actual":seam_p95, "threshold":"< 36 RGB levels"},
+        {"name":"polygon_halo", "pass":halo_score < 40.0,
+         "actual":halo_score, "threshold":"< 40 luminance levels"},
         {"name":"texture_ratio", "pass":.5 <= texture_ratio <= 2.0, "actual":texture_ratio, "threshold":"0.5–2.0"}]
     warnings = []
     if planning and planning.status == "global_warning": warnings.append("Global edit requested: regional isolation is not guaranteed semantically.")
@@ -184,19 +264,110 @@ def run_edit(image_path: str | Path, instruction: str, output_dir: str | Path, *
     summary = (f"Changed {changed_pct:.1f}% of the selected region. Mean OKLab ΔE was {mean_delta:.4f}. "
                f"Pixels changed outside the selection: {outside_changed}. "
                f"{'All hard checks passed.' if all(c['pass'] for c in checks) else 'One or more quality checks need review.'}")
-    receipt = {"schema_version":"1.1", "image":{"master_sha256":file_sha256(master_bytes), "result_sha256":file_sha256(result_bytes),
+    receipt = {"schema_version":"1.2", "image":{"master_sha256":file_sha256(master_bytes), "result_sha256":file_sha256(result_bytes),
         "master_size":{"width":w,"height":h,"bytes":len(master_bytes)}, "result_size":{"width":w,"height":h,"bytes":len(result_bytes)},
         "result_format":"PNG"}, "boxes":{"selected":B.as_dict(),"expanded":E.as_dict(),"coordinate_convention":"pixel half-open [x1,y1,x2,y2]"},
         "box_source":box_source,"selection_type":"freehand" if points else "box","points":points,"provider":provider.name,"model":provider.model,"seed":seed,"prompt":effective_instruction,
         "plan":plan_data,"metrics":metrics,"checks":checks,"warnings":warnings,"summary":summary,
-        "artifacts":{"result":str(result_path),"heatmap":str(heat_path)},
+        "alignment": {
+            "applied": alignment.applied,
+            "scale": alignment.scale,
+            "translation_x": alignment.translation_x,
+            "translation_y": alignment.translation_y,
+            "proposed_scale": alignment.proposed_scale,
+            "proposed_translation_x": alignment.proposed_translation_x,
+            "proposed_translation_y": alignment.proposed_translation_y,
+            "proposed_improvement_percent": alignment.proposed_improvement_percent,
+            "fit_best_scale": alignment.fit_best_scale,
+            "fit_best_translation_x": alignment.fit_best_translation_x,
+            "fit_best_translation_y": alignment.fit_best_translation_y,
+            "fit_best_improvement_percent": alignment.fit_best_improvement_percent,
+            "initial_score": alignment.initial_score,
+            "final_score": alignment.final_score,
+            "improvement_percent": alignment.improvement_percent,
+            "candidates_evaluated": alignment.candidates_evaluated,
+            "confidence": alignment.confidence,
+            "reason": alignment.reason,
+            "context_margin_px": context_margin,
+            "safety_margin_px": 10,
+            "translation_limit_px": 30,
+            "scale_range": [0.80, 1.20],
+            "phase_correlation_x": alignment.phase_correlation_x,
+            "phase_correlation_y": alignment.phase_correlation_y,
+            "context_ssim": alignment.context_ssim,
+            "context_gradient_similarity": alignment.context_gradient_similarity,
+            "context_colour_similarity": alignment.context_colour_similarity,
+            "context_coverage": alignment.context_coverage,
+            "validation_initial_score": alignment.validation_initial_score,
+            "validation_final_score": alignment.validation_final_score,
+            "validation_improvement_percent": alignment.validation_improvement_percent,
+            "registration_context_pixels": alignment.registration_context_pixels,
+            "validation_context_pixels": alignment.validation_context_pixels,
+            "context_sufficient": alignment.context_sufficient,
+            "search_config": alignment.search_config,
+            "selection_mask_moved": False,
+        },
+        "artifacts":{"result":str(result_path),"heatmap":str(heat_path),
+                     "generated_unaligned":str(raw_generated_path),
+                     "generated_aligned":str(aligned_generated_path)},
+        "seam": {**seam_metrics,
+                 "mean_threshold": 24.0, "p95_threshold": 36.0, "halo_threshold": 40.0,
+                 "feather_policy": "inward_only_within_hard_selection"},
+        "compositing": {
+            "hard_selection_pixels": int(mask_patch.sum()),
+            "feather_band_pixels": int(feather_band_patch.sum()),
+            "changed_outside_hard_selection_pixels": outside_hard_selection_changed,
+            "changed_outside_feather_support_pixels": outside_feather_support_changed,
+            "feather_policy": "inward_only_within_hard_selection",
+        },
         "model_input":{"width":model_input.width,"height":model_input.height,"proposed_output_width":out_size[0],"proposed_output_height":out_size[1],
                        "selection_aspect_ratio":round(B.width/B.height,6),"context_margin_px":context_margin,
                        "context_padding_px":{"left":pad_left,"top":pad_top,"right":pad_right,"bottom":pad_bottom},
                        "provider_output_width":provider_output_size[0],"provider_output_height":provider_output_size[1],
                        "provider_output_aspect_ratio":round(provider_output_size[0]/provider_output_size[1],6),
                        "crop_aspect_ratio":round(crop.width/crop.height,6),
-                       "aspect_ratio_corrected_without_stretching":abs(provider_output_size[0]/provider_output_size[1]-crop.width/crop.height)>1e-6}}
-    receipt_path = output_dir / "receipt.json"; receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+                       "aspect_ratio_corrected_without_stretching": normalization["aspect_ratio_corrected_without_stretching"],
+                       "normalization":normalization,
+                       "requested_output_aspect_error": round(abs((out_size[0] / out_size[1]) / (crop.width / crop.height) - 1.0), 8)},
+        "pipeline_geometry":{
+            "crop_size":{"width":crop.width,"height":crop.height},
+            "model_input_size":{"width":model_input.width,"height":model_input.height},
+            "model_input_scale":{"x":round(model_input.width/crop.width,10),"y":round(model_input.height/crop.height,10)},
+            "requested_provider_output_size":{"width":out_size[0],"height":out_size[1]},
+            "provider_output_size":{"width":provider_output_size[0],"height":provider_output_size[1]},
+            "provider_output_normalization":normalization,
+            "requested_output_aspect_error": round(abs((out_size[0] / out_size[1]) / (crop.width / crop.height) - 1.0), 8),
+            "crop_virtual_origin":{"x":virtual_x1,"y":virtual_y1},
+            "edge_padding":{"left":pad_left,"top":pad_top,"right":pad_right,"bottom":pad_bottom},
+            "alignment_coordinates":"normalized provider output mapped to crop pixel coordinates; all translations are crop-space pixels"
+        }}
+    receipt["artifacts"]["generated_provider_raw"] = str(provider_raw_path)
+    receipt_path = output_dir / "receipt.json"
     receipt["artifacts"]["receipt"] = str(receipt_path)
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    # One self-contained JSONL record per edit makes 50-100 edit audits easy.
+    diagnostic = {
+        "timestamp_unix": time.time(),
+        "provider": provider.name, "model": provider.model, "seed": seed,
+        "crop_size": [crop.width, crop.height],
+        "model_input_size": [model_input.width, model_input.height],
+        "requested_output_size": list(out_size),
+        "provider_output_size": list(provider_output_size),
+        "normalization": normalization,
+        "context_padding": {"left": pad_left, "top": pad_top, "right": pad_right, "bottom": pad_bottom},
+        "alignment": receipt["alignment"],
+    }
+    diagnostic_line = (json.dumps(diagnostic, separators=(",", ":")) + "\n").encode("utf-8")
+    diagnostic_path = output_dir / "alignment_diagnostics.jsonl"
+    diagnostic_path.write_bytes(diagnostic_line)
+    # Append-only project-level history; each record is a single append write.
+    history_path = output_dir.parent / "alignment_history.jsonl"
+    fd = os.open(str(history_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, diagnostic_line)
+    finally:
+        os.close(fd)
+    receipt["artifacts"]["alignment_diagnostics"] = str(diagnostic_path)
+    receipt["artifacts"]["alignment_history"] = str(history_path)
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     return receipt
