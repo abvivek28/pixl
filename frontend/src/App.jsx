@@ -242,6 +242,7 @@ export default function App() {
   const [apiState, setApiState] = useState("checking");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [selectionError, setSelectionError] = useState("");
   const [busy, setBusy] = useState(false);
   const [receiptPrinting, setReceiptPrinting] = useState(false);
   const [sourceFile, setSourceFile] = useState(null);
@@ -387,8 +388,9 @@ export default function App() {
     return [x1, y1, x2, y2];
   }
   async function runEdit() {
+    if (!boxPixels()) { setSelectionError("Please select a region on the image before applying your edit."); return; }
+    setSelectionError("");
     if (!prompt.trim()) { setError("Describe the change you want to make."); return; }
-    if (!boxPixels()) { setError("Draw a freehand target region on the image before editing."); return; }
     setBusy(true); setError(""); setSuccess(""); clearResult();
     try {
       const uploaded = await ensureUploaded();
@@ -466,7 +468,23 @@ export default function App() {
     try { const res = await fetch(url); if (!res.ok) throw new Error(); const blob = await res.blob(); const obj = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = obj; a.download = filename; a.click(); URL.revokeObjectURL(obj); }
     catch { setError("Could not download the image artifact."); }
   }
-  function resetWorkspace() { setSource(null); setSourceFile(null); if (localPreview) URL.revokeObjectURL(localPreview); setLocalPreview(""); setPrompt(""); setBox(null); setPoints(null); setPlan(null); setDimensions({ width: 0, height: 0 }); clearResult(); setError(""); setSuccess(""); setView("create"); }
+  function removeSourceImage() {
+    if (localPreview) URL.revokeObjectURL(localPreview);
+    setSource(null);
+    setSourceFile(null);
+    setLocalPreview("");
+    setPrompt("");
+    setBox(null);
+    setPoints(null);
+    setPlan(null);
+    setAnswerChoice("");
+    setDimensions({ width: 0, height: 0 });
+    setSelectionError("");
+    clearResult();
+    setError("");
+    setSuccess("Image removed. Upload another image to continue.");
+  }
+  function resetWorkspace() { removeSourceImage(); setSuccess(""); setView("create"); }
 
   const activeImage = !!sourceUrl;
   const planQuestions = plan?.plan?.questions || [];
@@ -495,7 +513,7 @@ export default function App() {
       {view === "create" && <div className="p4-create-grid">
         <section className="p4-panel p4-panel-project"><StepHeading index="01" title="Create an image" detail="Describe the frame you have in mind." /><label className="p4-label" htmlFor="generation-prompt">YOUR IMAGE IDEA</label><textarea id="generation-prompt" className="p4-textarea" rows={5} maxLength={4000} value={prompt} onChange={(e) => { setPrompt(e.target.value); setGenerationPlan(null); setGenerationAnswers({}); setGenerationImprovedPrompt(""); }} placeholder="A minimal ceramic vase on a warm limestone plinth, soft afternoon light…" /><div className="p4-generation-plan-actions"><button className="p4-button p4-button-light p4-full" onClick={planGenerationPrompt} disabled={busy || apiState !== "online" || !prompt.trim()}>{busy ? <LoaderCircle className="p4-spin" size={15} /> : <Scan size={15} />} Plan with Meta <Sparkles size={14} /></button><span>Optional · fill important gaps and build a richer prompt. Meta Contributor mode may use submitted prompts to improve Meta models.</span></div>
           {generationPlan && <div className="p4-plan-card p4-generation-plan-card"><div className="p4-plan-head"><span className="p4-overline">PROMPT DESIGN · {generationPlan.status === "ready" ? "READY" : "NEEDS DETAILS"}</span><span>{generationPlan.questions?.length ? `${generationPlan.questions.length} question(s)` : "Draft ready"}</span></div><p>{generationPlan.message}</p>{generationPlan.detected_details?.length > 0 && <div className="p4-preserve-list"><span>DETAILS ALREADY COVERED</span>{generationPlan.detected_details.map((item, i) => <small key={i}><Check size={11} />{item}</small>)}</div>}{generationPlan.questions?.length > 0 && <div className="p4-generation-questions">{generationPlan.questions.map((q) => <div className="p4-question" key={q.id}><strong>{q.question}</strong><small className="p4-question-reason">{q.reason}</small>{q.options.map((option) => <label key={option} className={`p4-option ${generationAnswers[q.id] === option ? "chosen" : ""}`}><input type="radio" name={`generation-${q.id}`} checked={generationAnswers[q.id] === option} onChange={() => setGenerationAnswers((prev) => ({ ...prev, [q.id]: option }))} /><span>{option}</span></label>)}</div>)}<button className="p4-button p4-button-orange p4-full" onClick={submitGenerationAnswers} disabled={busy || generationPlan.questions.some((q) => !generationAnswers[q.id])}>Use answers & refine prompt <ArrowRight size={14} /></button></div>}{generationPlan.assumptions?.length > 0 && <div className="p4-generation-assumptions"><strong>Reasonable defaults</strong><span>{generationPlan.assumptions.join(" · ")}</span></div>}{generationPlan.status === "ready" && <><label className="p4-label" htmlFor="improved-generation-prompt">FINAL PROMPT SENT TO IMAGE MODEL · EDITABLE</label><textarea id="improved-generation-prompt" className="p4-textarea" rows={7} maxLength={4000} value={generationImprovedPrompt} onChange={(e) => setGenerationImprovedPrompt(e.target.value)} /></>}</div>}
-          <div className="p4-field-row"><div className="p4-label">OUTPUT SIZE<span className="p4-static-value">Model default</span></div><div className="p4-label">ENGINE<span className="p4-static-value"><Zap size={14} /> FLUX.1 SCHNELL</span></div></div><button className="p4-button p4-button-orange p4-full" onClick={runGeneration} disabled={busy || apiState !== "online"}>{busy ? <LoaderCircle className="p4-spin" size={17} /> : <Sparkles size={17} />} Generate image <ArrowRight size={16} /></button><p className="p4-microcopy"><CircleHelp size={13} /> Prompt planning is optional. Without it, your original prompt is sent directly.</p>
+          <div className="p4-field-row"><div className="p4-label">OUTPUT SIZE<span className="p4-static-value">Model default</span></div><div className="p4-label">ENGINE<span className="p4-static-value"><Zap size={14} /> FLUX.1 SCHNELL</span></div></div><button className="p4-button p4-button-orange p4-full" onClick={runGeneration} disabled={busy || apiState !== "online"}>{busy ? <LoaderCircle className="p4-spin" size={17} /> : <Sparkles size={17} />} Generate image <ArrowRight size={16} /></button><p className="p4-microcopy"><CircleHelp size={13} /> Prompt planning is optional. Without it, your original prompt is sent directly. Requires the backend to be configured with Cloudflare credentials.</p>
         </section>
         <section className="p4-panel p4-output-panel"><div className="p4-output-header"><span className="p4-overline">OUTPUT / 01</span><span className="p4-live-chip">{generationJob?.status || "WAITING"}</span></div>{generationJob?.artifacts?.result ? <div className="p4-generated-image"><img src={assetUrl(generationJob.artifacts.result)} alt="Generated image" /></div> : <div className="p4-output-empty"><div className="p4-output-shape"><span /><span /><span /></div><strong>Your next image starts here.</strong><span>Generated artwork and job progress will appear in this panel.</span></div>}
           <JobProgress job={generationJob} />
@@ -505,7 +523,6 @@ export default function App() {
 
       {view === "edit" && <div className="p4-edit-grid">
         <section className="p4-panel p4-editor-controls"><StepHeading index="02" title="Refine a region" detail="Draw a target region around the area you want to change." />
-          {!source && <UploadDrop onFile={chooseSource} fileName={sourceFile?.name} />}
           {source && <div className="p4-source-pill"><FileImage size={15} /><span>{source.filename}</span><small>{source.width} × {source.height}</small><button onClick={resetWorkspace} title="Choose another image"><RefreshCw size={13} /></button></div>}
           <label className="p4-label" htmlFor="edit-prompt">WHAT SHOULD CHANGE?</label><textarea id="edit-prompt" className="p4-textarea" rows={4} maxLength={4000} value={prompt} onChange={(e) => { setPrompt(e.target.value); setPlan(null); }} placeholder="Change the wall to a muted sage green. Keep the furniture, framing and lighting unchanged." />
           <div className="p4-edit-engine-note"><Sparkles size={14} /><span><strong>Cloudflare AI editing</strong><small>Edits are processed using FLUX.2 Klein 4B.</small></span></div>
@@ -515,10 +532,11 @@ export default function App() {
             {plan.warnings?.map((warning, i) => <p className="p4-plan-warning" key={i}>{warning}</p>)}
             {plan.status === "needs_manual_box" && <p className="p4-plan-warning">Select the target region manually. Model coordinates remain unverified and are not applied automatically.</p>}
           </div>}
-          <button className="p4-button p4-button-orange p4-full p4-run-edit" onClick={runEdit} disabled={busy || !activeImage || !prompt.trim() || !boxPixels()}>{busy ? <LoaderCircle className="p4-spin" size={16} /> : <WandSparkles size={16} />} Apply edit <ArrowRight size={16} /></button>
+          <button className="p4-button p4-button-orange p4-full p4-run-edit" onClick={runEdit} disabled={busy || !activeImage || !prompt.trim()}>{busy ? <LoaderCircle className="p4-spin" size={16} /> : <WandSparkles size={16} />} Apply edit <ArrowRight size={16} /></button>
+          {selectionError && <p className="p4-selection-error" role="alert">{selectionError}</p>}
           <p className="p4-microcopy"><ShieldCheck size={13} /> Only the selected freehand region is composited into the output. A confirmed selection is required.</p>
         </section>
-        <section className="p4-panel p4-canvas-panel"><div className="p4-canvas-title"><div><span className="p4-overline">CANVAS / TARGET SELECTION</span><h3>Choose the edit area</h3></div><span className="p4-coordinate-tag">{dimensions.width ? `${dimensions.width} × ${dimensions.height}` : "NO IMAGE"}</span></div><ImageCanvas imageSrc={sourceUrl} box={box} setBox={setBox} points={points} setPoints={setPoints} dimensions={dimensions} setDimensions={setDimensions} /><div className="p4-canvas-help"><span><i className="p4-help-dot" /> Drag freehand to outline target area</span><span><i className="p4-help-outline" /> Release to close contour</span><span><i className="p4-help-grid" /> Outside region preserved bit-for-bit</span></div></section>
+        <section className="p4-panel p4-canvas-panel"><div className="p4-canvas-title"><div><span className="p4-overline">CANVAS / TARGET SELECTION</span><h3>{sourceUrl ? "Choose the edit area" : "Start by uploading an image"}</h3></div><div className="p4-canvas-title-actions"><span className="p4-coordinate-tag">{dimensions.width ? `${dimensions.width} × ${dimensions.height}` : "NO IMAGE"}</span>{sourceUrl && <button type="button" className="p4-button p4-button-light p4-remove-image" onClick={removeSourceImage} disabled={busy} title="Remove this image and choose another"><X size={13} /> Remove image</button>}</div></div>{!sourceUrl ? <UploadDrop onFile={chooseSource} fileName={sourceFile?.name} /> : <><ImageCanvas imageSrc={sourceUrl} box={box} setBox={(next) => { setBox(next); if (next) setSelectionError(""); }} points={points} setPoints={(next) => { setPoints(next); if (next) setSelectionError(""); }} dimensions={dimensions} setDimensions={setDimensions} /><div className="p4-canvas-help"><span><i className="p4-help-dot" /> Drag freehand to outline target area</span><span><i className="p4-help-outline" /> Release to close contour</span><span><i className="p4-help-grid" /> Outside region preserved bit-for-bit</span></div></>}</section>
       </div>}
 
       {view === "results" && <div className="p4-results-layout">
